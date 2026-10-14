@@ -19,18 +19,38 @@ from fastapi.responses import FileResponse, RedirectResponse
 from jose import jwt, JWTError
 from pdf2image import convert_from_path
 from PIL import Image
+from contextlib import asynccontextmanager
+import asyncio
+
+from db import SessionLocal, engine
+from models import PDF, PDF_Pages, Summary, StickyNote, Base
 
 
 from fastapi.middleware.cors import CORSMiddleware
 
 
 
-app = FastAPI()
+from worker import summary_worker
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(summary_worker())
+
+    yield  # app runs here
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+app = FastAPI(lifespan=lifespan)
+
 
 # Add this right after app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://localhost:3001"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,43 +68,36 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# Initialize SQLAlchemy for Database Operations
-DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-class PDF(Base):
-    __tablename__ = "pdfs"
-    id = Column(Integer, primary_key = True, index = True)
-    user_id = Column(UUID(as_uuid=True), index=True)
-    file_name = Column(String)
-    storage_path = Column(String)
-    supabase_path = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    summaries = relationship("Summary", back_populates="pdf")
-    pdf_pages = relationship("PDF_Pages", back_populates="pdf")
-
-class Summary(Base):
-    __tablename__ = "summaries"
-    id = Column(Integer, primary_key = True, index = True)
-    pdf_id = Column(Integer, ForeignKey("pdfs.id"))
-    summary = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    pdf = relationship("PDF", back_populates="summaries")
-    #Create a model used var as well
-
-class PDF_Pages(Base):
-    __tablename__ = "pdf_pages"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    pdf_id = Column(Integer, ForeignKey("pdfs.id"))
-    image_path = Column(String) #where to store the images
-    page_number = Column(Integer)
-    supabase_path = Column(String, nullable=True)
-    summary = Column(String) #Store given sumamry of page
-    created_at = Column(DateTime, default=datetime.utcnow)
-    pdf = relationship("PDF", back_populates="pdf_pages")
+ 
+ 
+# 2. ADD THESE PYDANTIC SCHEMAS (alongside your other response models)
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+class StickyNoteCreate(BaseModel):
+    pdf_id:      int
+    page_number: int
+    text:        str = ""
+    x:           float
+    y:           float
+    color_idx:   int = 0
+ 
+class StickyNoteUpdate(BaseModel):
+    text:      str | None = None
+    x:         int | None = None
+    y:         int | None = None
+    color_idx: int | None = None
+ 
+class StickyNoteResponse(BaseModel):
+    id:          int
+    pdf_id:      int
+    page_number: int
+    text:        str
+    x:           int
+    y:           int
+    color_idx:   int
+    created_at:  datetime
+ 
+    model_config = ConfigDict(from_attributes=True)
 
 
 Base.metadata.create_all(bind=engine)
@@ -239,6 +252,8 @@ class PDFResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
      
 #Convertion method, turn pdf into png
+from io import BytesIO
+
 def convert_pdf_to_pages(pdf_path: str, pdf_id: int, user_id: str, file_id: str, db: Session):
     pages = convert_from_path(pdf_path, poppler_path=r"C:\Program Files (x86)\poppler-25.12.0\Library\bin")
 
@@ -247,75 +262,71 @@ def convert_pdf_to_pages(pdf_path: str, pdf_id: int, user_id: str, file_id: str,
 
     for i, page in enumerate(pages, start=1):
         image_file_path = f"{page_folder}/{i}.png"
-
-        # save image
         page.save(image_file_path, "PNG")
 
         supabase_page_path = f"{user_id}/{file_id}/pages/{i}.png"
         with open(image_file_path, "rb") as img_file:
-            supabase_admin.storage.from_("pdf-pages").upload(
+            supabase_admin.storage.from_("pdf-pages").upload(  # admin client
                 path=supabase_page_path,
                 file=img_file.read(),
                 file_options={"content-type": "image/png", "upsert": "true"}
             )
 
-        # save page in DB
         db_page = PDF_Pages(
             pdf_id=pdf_id,
             page_number=i,
             image_path=f"pdfs/{file_id}/pages/{i}.png",
             supabase_path=supabase_page_path,
-            summary = "empty"
+            summary="empty"
         )
-
         db.add(db_page)
 
     db.commit()
 
 #Upload new PDF into Database
 @app.post("/pdf/upload", response_model=PDFResponse)
-def create_pdf(file : UploadFile = File(...), db: Session = Depends(get_db), current_user = Depends(verify_token)):
+def create_pdf(file: UploadFile = File(...), db: Session = Depends(get_db), current_user = Depends(verify_token)):
     file_id = str(uuid.uuid4())
-    
-
     folder = f"storage/pdfs/{file_id}"
     os.makedirs(folder, exist_ok=True)
-    
     path = f"{folder}/original.pdf"
 
     file_bytes = file.file.read()
     with open(path, "wb") as buffer:
         buffer.write(file_bytes)
-    
+
     supabase_path = f"{current_user['sub']}/{file_id}/original.pdf"
     supabase_admin.storage.from_("pdfs").upload(
         path=supabase_path,
         file=file_bytes,
         file_options={"content-type": "application/pdf", "upsert": "true"}
     )
-    
-    #using user id from supabase auth
-    pdf = PDF(file_name = file.filename, 
-              storage_path = path,
-              supabase_path=supabase_path, 
-              user_id=current_user["sub"]
-              )
 
+    pdf = PDF(
+        file_name=file.filename,
+        storage_path=path,
+        supabase_path=supabase_path,
+        user_id=uuid.UUID(current_user["sub"])
+    )
     db.add(pdf)
     db.commit()
     db.refresh(pdf)
-    #conversion method called when uploaded
-    convert_pdf_to_pages(path, pdf.id, current_user["sub"], file_id, db)
+
+    # Wrap conversion so we can see the real error
+    try:
+        convert_pdf_to_pages(path, pdf.id, current_user["sub"], file_id, db)
+    except Exception as e:
+        print(f"❌ convert_pdf_to_pages failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Page conversion failed: {str(e)}")
 
     return pdf
 
 #Get all user pdfs
 @app.get("/pdf/my_pdfs", response_model=List[PDFResponse])
-def get_my_pdfs(current_user = Depends(verify_token), db: Session = Depends(get_db), skip: int = 0, limit: int = 10):
-
+def get_my_pdfs(current_user=Depends(verify_token), db: Session = Depends(get_db)):
     pdfs = db.query(PDF).filter(
         PDF.user_id == uuid.UUID(current_user["sub"])
-    ).offset(skip).limit(limit).all()
+    ).order_by(PDF.created_at.desc()).all()
     return pdfs
 
 
@@ -330,6 +341,8 @@ class PDFPageResponse(BaseModel):
     id: int
     pdf_id: int
     image_path: str
+    page_number: int 
+    summary: str
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -350,28 +363,35 @@ def get_pdf_pages(id : int, db : Session = Depends(get_db), current_user = Depen
         return pages
 
 #Get Page PNG image
-@app.get("/pdf/{id}/pages/{page_number}", response_model=PDFPageResponse)
-def get_pdf_page(id : int, page_number : int, db : Session = Depends(get_db), current_user = Depends(verify_token)):
+@app.get("/pdf/{id}/pages/{page_number}")
+def get_pdf_page(id: int, page_number: int, db: Session = Depends(get_db), current_user = Depends(verify_token)):
     pdf = db.query(PDF).filter(PDF.id == id).first()
     if pdf is None:
-        raise HTTPException(status_code=404, detail="PDF not Found")
+        raise HTTPException(status_code=404, detail="PDF not found")
     if str(pdf.user_id) != current_user["sub"]:
-        raise HTTPException(status_code=403, detail="Not authorized to access this PDF")
+        raise HTTPException(status_code=403, detail="Not authorized")
 
-    local_path = f"storage/pdfs/{id}/pages/{page_number}.png"
+    page = db.query(PDF_Pages).filter(
+        PDF_Pages.pdf_id == id,
+        PDF_Pages.page_number == page_number
+    ).first()
+    
+    if page is None:
+        raise HTTPException(status_code=404, detail="Page not found")
+
+    # Try local file first using image_path from DB (not hardcoded)
+    local_path = f"storage/{page.image_path}"
     if os.path.exists(local_path):
         return FileResponse(path=local_path, media_type="image/png")
-    else:
-        page = db.query(PDF_Pages).filter(
-            PDF_Pages.pdf_id == id,
-            PDF_Pages.page_number == page_number
-        ).first()
-        if page is None or page.supabase_path is None:
-            raise HTTPException(status_code=404, detail="Page not Found")
-        signed = supabase_admin.storage.from_("pdf-pages").create_signed_url(
-            page.supabase_path, expires_in=3600
-        )
-        return RedirectResponse(url=signed["signedURL"])
+
+    # Fall back to Supabase signed URL
+    if page.supabase_path is None:
+        raise HTTPException(status_code=404, detail="No file path available")
+    
+    signed = supabase_admin.storage.from_("pdf-pages").create_signed_url(
+        page.supabase_path, expires_in=3600
+    )
+    return RedirectResponse(url=signed["signedURL"])
 
 #Return certain PDF data with the user id
 @app.get("/pdf/{id}", response_model=PDFResponse)
@@ -392,18 +412,61 @@ def get_pdf(id : int, db : Session = Depends(get_db), current_user = Depends(ver
     pdf = db.query(PDF).filter(PDF.id == id).first()
     if pdf is None:
         raise HTTPException(status_code=404, detail="PDF not Found")
+    
     if str(pdf.user_id) != current_user["sub"]:
         raise HTTPException(status_code=403, detail="Not authorized to access this PDF")
+    
+    return FileResponse(
+        path=pdf.storage_path,
+        media_type="application/pdf",
+        filename=pdf.file_name 
+    )
 
-    if os.path.exists(pdf.storage_path):
-        return FileResponse(path=pdf.storage_path, media_type="application/pdf", filename=pdf.file_name)
-    else:
-        if pdf.supabase_path is None:
-            raise HTTPException(status_code=404, detail="File not Found")
-        signed = supabase_admin.storage.from_("pdfs").create_signed_url(
-            pdf.supabase_path, expires_in=3600
-        )
-        return RedirectResponse(url=signed["signedURL"])
+# ── Chat endpoint ──────────────────────────────────────────────────────────────
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    pdf_id: int | None = None
+    messages: list[ChatMessage]
+
+class ChatResponse(BaseModel):
+    reply: str
+
+@app.post("/chat", response_model=ChatResponse)
+def chat_endpoint(
+    req: ChatRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(verify_token),
+):
+    """Ask a question about a paper (or all papers). Uses the RAG pipeline."""
+    # If pdf_id is provided, verify the user owns it
+    if req.pdf_id is not None:
+        pdf = db.query(PDF).filter(PDF.id == req.pdf_id).first()
+        if pdf is None:
+            raise HTTPException(status_code=404, detail="PDF not found")
+        if str(pdf.user_id) != current_user["sub"]:
+            raise HTTPException(status_code=403, detail="Not authorized to access this PDF")
+
+    # Extract the latest user message as the query
+    question = ""
+    for msg in reversed(req.messages):
+        if msg.role == "user":
+            question = msg.content
+            break
+
+    if not question:
+        raise HTTPException(status_code=400, detail="No user message found")
+
+    # Pass full conversation history so the LLM can follow up
+    messages_dicts = [{"role": m.role, "content": m.content} for m in req.messages]
+
+    from agent import chat
+    answer = chat(question, pdf_id=req.pdf_id, messages=messages_dicts)
+    return ChatResponse(reply=answer)
+
 
 #Summary Data Contracts
 class SummaryRequest(BaseModel):
@@ -475,3 +538,111 @@ def get_summary(pdf_id : int, db : Session = Depends(get_db), current_user = Dep
         raise HTTPException(status_code=404, detail="Summary not Found")
     
     return summary
+
+ 
+@app.post("/notes/", response_model=StickyNoteResponse)
+def create_note(
+    payload: StickyNoteCreate,
+    db: Session = Depends(get_db),
+    current_user=Depends(verify_token),
+):
+    """Create a sticky note for the authenticated user."""
+    # Verify the PDF belongs to this user
+    pdf = db.query(PDF).filter(PDF.id == payload.pdf_id).first()
+    if pdf is None:
+        raise HTTPException(status_code=404, detail="PDF not found")
+    if str(pdf.user_id) != current_user["sub"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+ 
+    note = StickyNote(
+        user_id=uuid.UUID(current_user["sub"]),
+        pdf_id=payload.pdf_id,
+        page_number=payload.page_number,
+        text=payload.text,
+        x=payload.x,
+        y=payload.y,
+        color_idx=payload.color_idx,
+    )
+    db.add(note)
+    db.commit()
+    db.refresh(note)
+    return note
+ 
+ 
+@app.get("/notes/{pdf_id}", response_model=List[StickyNoteResponse])
+def get_notes_for_pdf(
+    pdf_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(verify_token),
+):
+    """Return all sticky notes the current user placed on a specific PDF."""
+    pdf = db.query(PDF).filter(PDF.id == pdf_id).first()
+    if pdf is None:
+        raise HTTPException(status_code=404, detail="PDF not found")
+    if str(pdf.user_id) != current_user["sub"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+ 
+    return (
+        db.query(StickyNote)
+        .filter(
+            StickyNote.pdf_id == pdf_id,
+            StickyNote.user_id == uuid.UUID(current_user["sub"]),
+        )
+        .order_by(StickyNote.page_number, StickyNote.id)
+        .all()
+    )
+ 
+ 
+@app.patch("/notes/{note_id}", response_model=StickyNoteResponse)
+def update_note(
+    note_id: int,
+    payload: StickyNoteUpdate,
+    db: Session = Depends(get_db),
+    current_user=Depends(verify_token),
+):
+    """Update text, position, or colour of a note."""
+    note = db.query(StickyNote).filter(StickyNote.id == note_id).first()
+    if note is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    if str(note.user_id) != current_user["sub"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+ 
+    if payload.text      is not None: note.text      = payload.text
+    if payload.x         is not None: note.x         = payload.x
+    if payload.y         is not None: note.y         = payload.y
+    if payload.color_idx is not None: note.color_idx = payload.color_idx
+ 
+    db.commit()
+    db.refresh(note)
+    return note
+ 
+ 
+@app.delete("/notes/{note_id}", status_code=204)
+def delete_note(
+    note_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(verify_token),
+):
+    """Delete a sticky note."""
+    note = db.query(StickyNote).filter(StickyNote.id == note_id).first()
+    if note is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    if str(note.user_id) != current_user["sub"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+ 
+    db.delete(note)
+    db.commit()
+
+
+#background worker
+
+
+
+
+#backup if no work
+#@app.on_event("startup")
+#async def start_worker():
+ #   from worker import summary_worker
+  #  import asyncio
+
+   # asyncio.create_task(summary_worker())
