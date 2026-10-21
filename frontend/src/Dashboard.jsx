@@ -385,7 +385,7 @@ const SUGGESTED_PROMPTS = [
 ];
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
-export default function Dashboard() {
+export default function Dashboard({ user, onLogout }) {
   const [uploadedFile, setUploadedFile]     = useState(null);
   const [pdfId, setPdfId]                   = useState(null);
   const [myPdfs, setMyPdfs]                 = useState([]);
@@ -746,6 +746,15 @@ export default function Dashboard() {
             <Menu size={20} />
           </button>
           <span className="text-[17px] font-semibold tracking-tight text-[#c4b5fd] flex-1">ResearchMate</span>
+          <div className="flex items-center gap-3 min-w-0">
+            <span className="hidden sm:block max-w-[180px] truncate text-[12px] text-[#9898b8]">
+              {user.name?.trim() || 'My account'}
+            </span>
+            <button type="button" onClick={onLogout}
+              className="shrink-0 rounded-lg border border-[#35354e] px-3 py-2 text-[12px] text-[#c4b5fd] hover:bg-[#252538] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#a78bfa]">
+              Log out
+            </button>
+          </div>
 
           {pdfLoaded && (
             <div className="flex items-center gap-2">
