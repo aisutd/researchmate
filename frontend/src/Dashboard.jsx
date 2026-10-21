@@ -1,5 +1,156 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Upload, MessageCircle, Menu, X, FileText, ChevronRight, Loader2, StickyNote, Trash2 } from 'lucide-react';
+import html2canvas from 'html2canvas';
+import { Upload, MessageCircle, Menu, X, FileText, ChevronRight, Loader2, StickyNote, Trash2, Scan } from 'lucide-react';
+
+// ─── Region capture ─────────────────────────────────────────────────────────
+export function selectionBounds(start, end) {
+  return {
+    x: Math.min(start.x, end.x), y: Math.min(start.y, end.y),
+    width: Math.abs(end.x - start.x), height: Math.abs(end.y - start.y),
+  };
+}
+
+export function RegionCapture() {
+  const [busy, setBusy] = useState(false);
+  const [snapshot, setSnapshot] = useState(null);
+  const [selection, setSelection] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [error, setError] = useState('');
+  const start = useRef(null);
+  const button = useRef(null);
+  const overlay = useRef(null);
+  const mounted = useRef(true);
+  const active = !!snapshot || !!preview;
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!preview) return;
+    return () => URL.revokeObjectURL(preview.url);
+  }, [preview]);
+
+  useEffect(() => {
+    if (!active) return;
+    overlay.current?.focus();
+    const close = () => {
+      setSnapshot(null); setPreview(null); setSelection(null); start.current = null;
+    };
+    const onKey = event => {
+      if (event.key === 'Escape') { event.preventDefault(); close(); }
+      // Keep keyboard focus inside the capture UI.
+      if (event.key === 'Tab') {
+        const items = overlay.current?.querySelectorAll('button, a[href]');
+        if (!items?.length) return;
+        const index = Array.from(items).indexOf(document.activeElement);
+        event.preventDefault();
+        items[(index + (event.shiftKey ? items.length - 1 : 1)) % items.length].focus();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('resize', close);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('resize', close);
+      button.current?.focus();
+    };
+  }, [active]);
+
+  const close = () => {
+    setSnapshot(null); setPreview(null); setSelection(null); start.current = null;
+  };
+
+  const begin = async () => {
+    setBusy(true); setError('');
+    try {
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      const canvas = await html2canvas(document.body, {
+        width, height, x: window.scrollX, y: window.scrollY,
+        scale: window.devicePixelRatio || 1,
+        backgroundColor: '#0e0e14', logging: false,
+        ignoreElements: element => element.hasAttribute('data-capture-ui'),
+      });
+      if (!mounted.current) return;
+      if (width !== window.innerWidth || height !== window.innerHeight) {
+        throw new Error('Viewport changed');
+      }
+      setSnapshot({ canvas, width, height, url: canvas.toDataURL('image/png') });
+    } catch {
+      if (mounted.current) setError('Could not capture the page. Please try again.');
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  };
+
+  const point = event => ({
+    x: Math.max(0, Math.min(snapshot.width, event.clientX)),
+    y: Math.max(0, Math.min(snapshot.height, event.clientY)),
+  });
+
+  const finish = async event => {
+    if (!start.current) return;
+    const bounds = selectionBounds(start.current, point(event));
+    start.current = null;
+    if (bounds.width < 5 || bounds.height < 5) { setSelection(null); return; }
+    setSelection(bounds);
+    try {
+      const scaleX = snapshot.canvas.width / snapshot.width;
+      const scaleY = snapshot.canvas.height / snapshot.height;
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(bounds.width * scaleX));
+      canvas.height = Math.max(1, Math.round(bounds.height * scaleY));
+      canvas.getContext('2d').drawImage(snapshot.canvas,
+        bounds.x * scaleX, bounds.y * scaleY, bounds.width * scaleX, bounds.height * scaleY,
+        0, 0, canvas.width, canvas.height);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      if (!blob) throw new Error('PNG encoding failed');
+      if (!mounted.current) return;
+      setPreview({ blob, url: URL.createObjectURL(blob), width: canvas.width, height: canvas.height });
+      setSnapshot(null); setSelection(null);
+    } catch {
+      close(); setError('Could not create the PNG. Please try again.');
+    }
+  };
+
+  return <>
+    <button ref={button} type="button" onClick={begin} disabled={busy} aria-busy={busy}
+      className="flex items-center gap-1.5 text-[12px] px-3 py-1.5 rounded-lg border border-[#252538] text-[#8888b0] hover:border-[#a78bfa] hover:text-[#c4b5fd] transition-all">
+      <Scan size={14} /><span>{busy ? 'Capturing…' : 'Capture area'}</span>
+    </button>
+    {error && <div data-capture-ui role="alert" className="capture-error">
+      {error}<button onClick={() => setError('')} aria-label="Dismiss capture error"><X size={16} /></button>
+    </div>}
+    {active && <div data-capture-ui ref={overlay} tabIndex={-1} role="dialog" aria-modal="true"
+      aria-label={preview ? 'PNG preview' : 'Select an area to capture'}
+      className={`capture-overlay ${preview ? 'capture-preview' : ''}`}>
+      {snapshot && <>
+        <img className="capture-snapshot" src={snapshot.url} alt="" draggable={false} />
+        <div className="capture-surface"
+          onPointerDown={event => {
+            if (!event.isPrimary || event.button !== 0) return;
+            event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId);
+            start.current = point(event); setSelection(selectionBounds(start.current, start.current));
+          }}
+          onPointerMove={event => { if (start.current) setSelection(selectionBounds(start.current, point(event))); }}
+          onPointerUp={finish}
+          onPointerCancel={() => { start.current = null; setSelection(null); }}>
+          {selection && <div className="capture-selection" style={{ left: selection.x, top: selection.y, width: selection.width, height: selection.height }} />}
+        </div>
+        <div className="capture-instructions">Drag to select an area · Esc to cancel <button onClick={close}>Cancel</button></div>
+      </>}
+      {preview && <div className="capture-card">
+        <div className="capture-heading"><strong>PNG preview</strong><button onClick={close} aria-label="Close PNG preview"><X size={20} /></button></div>
+        <img className="capture-result" src={preview.url} alt="Selected dashboard area" />
+        <div className="capture-footer"><span>{preview.width} × {preview.height} px · PNG</span>
+          <a href={preview.url} download="paperwise-capture.png">Download PNG</a>
+        </div>
+      </div>}
+    </div>}
+  </>;
+}
 
 // ─── Note colors ─────────────────────────────────────────────────────────────
 const NOTE_COLORS = [
@@ -532,6 +683,22 @@ export default function Dashboard() {
         .send-btn:disabled { opacity: 0.3; cursor: not-allowed; }
         .prompt-chip:hover { border-color: #a78bfa !important; color: #c4b5fd !important; }
         .split-handle:hover > div { background: #a78bfa !important; }
+
+        /* ─── Region capture styles ───────────────────────────────────────── */
+        .capture-overlay { position: fixed; inset: 0; z-index: 10000; outline: none; }
+        .capture-snapshot { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+        .capture-surface { position: absolute; inset: 0; cursor: crosshair; touch-action: none; user-select: none; overflow: hidden; }
+        .capture-selection { position: absolute; border: 2px solid #c4b5fd; box-shadow: 0 0 0 100vmax #0008; pointer-events: none; }
+        .capture-instructions { position: absolute; top: 16px; left: 50%; transform: translateX(-50%); background: #13131d; color: #e2e2f0; border: 1px solid #55557a; padding: 10px 16px; border-radius: 12px; font-size: 12px; white-space: nowrap; }
+        .capture-overlay button, .capture-error button { background: transparent; color: #c4b5fd; border: 0; cursor: pointer; padding: 6px; }
+        .capture-instructions button { margin-left: 12px; }
+        .capture-preview { background: #000a; display: flex; align-items: center; justify-content: center; padding: 24px; }
+        .capture-card { background: #13131d; border: 1px solid #35354e; border-radius: 16px; padding: 20px; max-width: 92vw; color: #e2e2f0; }
+        .capture-heading, .capture-footer { display: flex; align-items: center; justify-content: space-between; gap: 20px; font-size: 13px; }
+        .capture-result { display: block; max-width: 100%; max-height: 65vh; object-fit: contain; margin: 16px auto; }
+        .capture-footer { flex-wrap: wrap; color: #8888b0; }
+        .capture-footer a { background: #a78bfa; color: #13131d; border-radius: 8px; padding: 10px 14px; text-decoration: none; }
+        .capture-error { position: fixed; bottom: 24px; right: 24px; z-index: 10001; display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-radius: 10px; background: #301d2d; color: #ffd4df; font-size: 13px; }
       `}</style>
 
       {/* ── Sidebar ── */}
@@ -578,7 +745,7 @@ export default function Dashboard() {
           >
             <Menu size={20} />
           </button>
-          <span className="text-[17px] font-semibold tracking-tight text-[#c4b5fd] flex-1">paperwise</span>
+          <span className="text-[17px] font-semibold tracking-tight text-[#c4b5fd] flex-1">ResearchMate</span>
 
           {pdfLoaded && (
             <div className="flex items-center gap-2">
@@ -621,6 +788,8 @@ export default function Dashboard() {
                 <MessageCircle size={14} />
                 <span>{chatOpen ? 'Close chat' : 'Chat'}</span>
               </button>
+
+              <RegionCapture />
 
               <button
                 className="border border-[#252538] text-[#8888b0] hover:border-[#a78bfa] hover:text-[#c4b5fd] text-[12px] px-3 py-1.5 rounded-lg transition-all"
